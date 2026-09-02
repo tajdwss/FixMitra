@@ -1,0 +1,13 @@
+{
+  "name": "fixmitra",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev:api": "npm --workspace @fixmitra/api run dev",
+    "dev:web": "npm --workspace @fixmitra/web run dev",
+    "dev:mobile": "npm --workspace @fixmitra/mobile run start",
+    "build": "npm run build --workspaces --if-present"
+  },
+  "engines": { "node": ">=20" }
+}
