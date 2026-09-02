@@ -1,0 +1,6 @@
+import { SafeAreaView, StyleSheet, Text, View, Pressable } from "react-native";
+
+export default function App() {
+  return <SafeAreaView style={styles.page}><Text style={styles.brand}>FIXMITRA</Text><Text style={styles.title}>Technician Desk</Text><Text style={styles.subtitle}>आज के assigned repairs और status updates यहीं मिलेंगे।</Text><View style={styles.card}><Text style={styles.cardTitle}>Phase 1 mobile foundation</Text><Text style={styles.cardText}>Login, assigned repair queue, photo upload और status update अगला implementation है।</Text><Pressable style={styles.button}><Text style={styles.buttonText}>Repair Queue</Text></Pressable></View></SafeAreaView>;
+}
+const styles = StyleSheet.create({ page:{flex:1,backgroundColor:'#f5f8fb',padding:24}, brand:{color:'#007c6d',fontWeight:'800',letterSpacing:2,marginTop:20}, title:{fontSize:30,fontWeight:'800',color:'#172033',marginTop:6}, subtitle:{fontSize:16,lineHeight:24,color:'#667386',marginTop:10}, card:{backgroundColor:'#fff',borderRadius:16,padding:20,marginTop:32}, cardTitle:{fontSize:18,fontWeight:'700',color:'#172033'}, cardText:{color:'#667386',lineHeight:21,marginTop:8}, button:{backgroundColor:'#007c6d',padding:13,borderRadius:10,marginTop:20,alignItems:'center'}, buttonText:{color:'#fff',fontWeight:'800'} });
