@@ -1,37 +1,30 @@
+import bcrypt from "bcryptjs";
 import cors from "cors";
-import express from "express";
-import { randomUUID } from "node:crypto";
+import express, { type NextFunction, type Request, type Response } from "express";
+import jwt from "jsonwebtoken";
 import { z } from "zod";
+import { assertDatabase, db } from "./database.js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-
+const jwtSecret = process.env.JWT_SECRET ?? "development-only-change-me";
 const statuses = ["RECEIVED", "INSPECTION", "ESTIMATE_SENT", "APPROVED", "WAITING_FOR_PARTS", "IN_PROGRESS", "QUALITY_CHECK", "READY", "DELIVERED", "CANCELLED"] as const;
-const createJobSchema = z.object({
-  customerName: z.string().trim().min(2), phone: z.string().trim().min(10),
-  category: z.enum(["MOBILE", "ELECTRONICS"]), product: z.string().trim().min(2),
-  brand: z.string().trim().optional(), model: z.string().trim().optional(), imei1: z.string().trim().optional(),
-  imei2: z.string().trim().optional(), quantity: z.number().int().positive().default(1),
-  complaint: z.string().trim().min(3), estimatedAmount: z.number().nonnegative().optional()
-});
-type Job = z.infer<typeof createJobSchema> & { id: string; ticketNo: string; status: typeof statuses[number]; createdAt: string };
-const jobs: Job[] = [];
+type Claims = { userId: string; tenantId: string; role: string };
+type AuthRequest = Request & { auth?: Claims };
+const ownerSetupSchema = z.object({ businessName: z.string().min(2), slug: z.string().regex(/^[a-z0-9-]+$/), ownerName: z.string().min(2), phone: z.string().min(10), password: z.string().min(8) });
+const loginSchema = z.object({ slug: z.string().min(2), phone: z.string().min(10), password: z.string().min(8) });
+const jobSchema = z.object({ customerName:z.string().trim().min(2), phone:z.string().trim().min(10), category:z.enum(["MOBILE","ELECTRONICS"]), product:z.string().trim().min(2), brand:z.string().trim().optional(), model:z.string().trim().optional(), imei1:z.string().trim().optional(), imei2:z.string().trim().optional(), quantity:z.number().int().positive().default(1), complaint:z.string().trim().min(3), estimatedAmount:z.number().nonnegative().optional() });
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "FixMitra API" }));
-app.get("/api/repair-jobs", (_req, res) => res.json(jobs));
-app.post("/api/repair-jobs", (req, res) => {
-  const result = createJobSchema.safeParse(req.body);
-  if (!result.success) return res.status(400).json({ message: "Please enter all required repair details.", errors: result.error.flatten() });
-  const job: Job = { ...result.data, id: randomUUID(), ticketNo: `FM-${String(jobs.length + 1).padStart(6, "0")}`, status: "RECEIVED", createdAt: new Date().toISOString() };
-  jobs.unshift(job); return res.status(201).json(job);
-});
-app.patch("/api/repair-jobs/:id/status", (req, res) => {
-  const status = z.enum(statuses).safeParse(req.body.status);
-  const job = jobs.find((item) => item.id === req.params.id);
-  if (!job) return res.status(404).json({ message: "Repair job not found." });
-  if (!status.success) return res.status(400).json({ message: "Invalid repair status." });
-  job.status = status.data; return res.json(job);
-});
+function requireAuth(req: AuthRequest, res: Response, next: NextFunction) { const token = req.headers.authorization?.replace(/^Bearer\s+/i, ""); if (!token) return res.status(401).json({ message: "Login required." }); try { req.auth = jwt.verify(token, jwtSecret) as Claims; next(); } catch { return res.status(401).json({ message: "Session expired. Please login again." }); } }
+function requireRole(...roles: string[]) { return (req: AuthRequest, res: Response, next: NextFunction) => !req.auth || !roles.includes(req.auth.role) ? res.status(403).json({ message: "You do not have permission for this action." }) : next(); }
+function sendToken(res: Response, claims: Claims) { return res.json({ token: jwt.sign(claims, jwtSecret, { expiresIn: "12h" }), user: claims }); }
+
+app.get("/health", async (_req, res) => { try { if (db) await db.query("SELECT 1"); res.json({ ok:true, database: Boolean(db) }); } catch { res.status(503).json({ ok:false, database:false }); } });
+app.post("/api/setup/owner", async (req, res) => { const input = ownerSetupSchema.safeParse(req.body); if (!input.success) return res.status(400).json({ message:"Please enter valid business and owner details." }); try { const pool = await assertDatabase(); const exists = await pool.query("SELECT 1 FROM tenants WHERE slug=$1", [input.data.slug]); if (exists.rowCount) return res.status(409).json({ message:"This business URL is already in use." }); const client = await pool.connect(); try { await client.query("BEGIN"); const tenant = await client.query("INSERT INTO tenants(name,slug,phone) VALUES($1,$2,$3) RETURNING id", [input.data.businessName,input.data.slug,input.data.phone]); const owner = await client.query("INSERT INTO users(tenant_id,name,phone,password_hash,role) VALUES($1,$2,$3,$4,'OWNER') RETURNING id", [tenant.rows[0].id,input.data.ownerName,input.data.phone,await bcrypt.hash(input.data.password,12)]); await client.query("COMMIT"); return sendToken(res,{tenantId:tenant.rows[0].id,userId:owner.rows[0].id,role:"OWNER"}); } catch(e) { await client.query("ROLLBACK"); throw e; } finally { client.release(); } } catch (error) { return res.status(500).json({ message: error instanceof Error ? error.message : "Setup failed." }); } });
+app.post("/api/auth/login", async (req,res) => { const input=loginSchema.safeParse(req.body); if(!input.success) return res.status(400).json({message:"Invalid login details."}); try { const pool=await assertDatabase(); const result=await pool.query("SELECT u.id,u.tenant_id,u.role,u.password_hash,u.is_active FROM users u JOIN tenants t ON t.id=u.tenant_id WHERE t.slug=$1 AND u.phone=$2",[input.data.slug,input.data.phone]); const user=result.rows[0]; if(!user || !user.is_active || !(await bcrypt.compare(input.data.password,user.password_hash))) return res.status(401).json({message:"Mobile number or password is incorrect."}); return sendToken(res,{userId:user.id,tenantId:user.tenant_id,role:user.role}); } catch(error) { return res.status(500).json({message:error instanceof Error?error.message:"Login failed."}); } });
+app.get("/api/repair-jobs", requireAuth, async (req:AuthRequest,res) => { try { const pool=await assertDatabase(); const result=await pool.query("SELECT r.*,c.name customer_name,c.phone FROM repair_jobs r JOIN customers c ON c.id=r.customer_id WHERE r.tenant_id=$1 ORDER BY r.created_at DESC",[req.auth!.tenantId]); res.json(result.rows); } catch(error) { res.status(500).json({message:error instanceof Error?error.message:"Unable to load repair jobs."}); } });
+app.post("/api/repair-jobs", requireAuth, async (req:AuthRequest,res) => { const input=jobSchema.safeParse(req.body); if(!input.success) return res.status(400).json({message:"Please enter all required repair details.",errors:input.error.flatten()}); try { const pool=await assertDatabase(); const client=await pool.connect(); try { await client.query("BEGIN"); const customer=await client.query("INSERT INTO customers(tenant_id,name,phone) VALUES($1,$2,$3) ON CONFLICT(tenant_id,phone) DO UPDATE SET name=EXCLUDED.name,updated_at=now() RETURNING id",[req.auth!.tenantId,input.data.customerName,input.data.phone]); const ticket=`FM-${Date.now().toString().slice(-8)}-${Math.floor(Math.random()*90+10)}`; const job=await client.query("INSERT INTO repair_jobs(tenant_id,customer_id,ticket_no,category,product,brand,model,imei_1,imei_2,quantity,complaint,estimated_amount,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *",[req.auth!.tenantId,customer.rows[0].id,ticket,input.data.category,input.data.product,input.data.brand||null,input.data.model||null,input.data.imei1||null,input.data.imei2||null,input.data.quantity,input.data.complaint,input.data.estimatedAmount??null,req.auth!.userId]); await client.query("INSERT INTO repair_status_events(repair_job_id,new_status,changed_by) VALUES($1,'RECEIVED',$2)",[job.rows[0].id,req.auth!.userId]); await client.query("COMMIT"); res.status(201).json(job.rows[0]); } catch(e) { await client.query("ROLLBACK"); throw e; } finally { client.release(); } } catch(error) { res.status(500).json({message:error instanceof Error?error.message:"Unable to create repair job."}); } });
+app.patch("/api/repair-jobs/:id/status", requireAuth, requireRole("OWNER","MANAGER","RECEPTION","TECHNICIAN"), async (req:AuthRequest,res) => { const status=z.enum(statuses).safeParse(req.body.status); if(!status.success) return res.status(400).json({message:"Invalid repair status."}); try { const pool=await assertDatabase(); const result=await pool.query("UPDATE repair_jobs SET status=$1,updated_at=now() WHERE id=$2 AND tenant_id=$3 RETURNING *",[status.data,req.params.id,req.auth!.tenantId]); if(!result.rowCount) return res.status(404).json({message:"Repair job not found."}); await pool.query("INSERT INTO repair_status_events(repair_job_id,new_status,changed_by) VALUES($1,$2,$3)",[req.params.id,status.data,req.auth!.userId]); res.json(result.rows[0]); } catch(error) { res.status(500).json({message:error instanceof Error?error.message:"Unable to update status."}); } });
 
 app.listen(Number(process.env.PORT ?? 4000), () => console.log("FixMitra API running on http://localhost:4000"));
